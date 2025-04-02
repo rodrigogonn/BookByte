@@ -1,0 +1,1 @@
+export const MAX_DATA_FOR_PROMPT = 400000;

@@ -77,12 +77,20 @@ Envie um arquivo PDF para processamento:
 curl -X POST -F "file=@seu_livro.pdf" http://localhost:3000/upload
 ```
 
-#### POST /summary
+#### POST /summarize
+
+Envie um texto para resumo e formatação:
+
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"text":"seu texto aqui"}' http://localhost:3000/summarize
+```
+
+#### POST /summarizeChunk
 
 Envie um texto para condensação:
 
 ```bash
-curl -X POST -H "Content-Type: application/json" -d '{"text":"seu texto aqui"}' http://localhost:3000/summary
+curl -X POST -H "Content-Type: application/json" -d '{"text":"seu texto aqui"}' http://localhost:3000/summarizeChunk
 ```
 
 ## 📝 Notas

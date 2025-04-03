@@ -8,18 +8,20 @@ import {
   extractBookCategoriesAndDescription,
   extractBookInfo,
   summarizeAndFormatChapter,
-  summarizeChunk,
 } from './prompts';
 import { z } from 'zod';
 import { MAX_DATA_FOR_PROMPT } from './constants/prompt';
+import { middlewares } from './middlewares';
+import cors from 'cors';
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
+app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 const ChapterSchema = z.object({
-  name: z.string().min(1, 'Nome do capítulo é obrigatório'),
+  title: z.string().min(1, 'Nome do capítulo é obrigatório'),
   startPage: z
     .number()
     .int()
@@ -47,14 +49,15 @@ interface Book {
   author: string;
   description: string;
   chapters: Array<{
-    name: string;
+    title: string;
     content: object[];
   }>;
   categoryIds: number[];
 }
 
 app.post(
-  '/upload',
+  '/extract',
+  middlewares.adminAuth,
   upload.single('file'),
   async (req: Request, res: Response): Promise<void> => {
     if (!req.file) {
@@ -96,7 +99,7 @@ app.post(
           );
 
           return {
-            name: chapter.name,
+            title: chapter.title,
             content: chapterFormatted,
           };
         })
@@ -136,38 +139,6 @@ app.post(
     }
   }
 );
-
-app.post('/summarize', async (req: Request, res: Response) => {
-  if (!req.body.text) {
-    res.status(400).json({ error: 'Nenhum texto enviado.' });
-    return;
-  }
-
-  try {
-    const summary = await summarizeAndFormatChapter(req.body.text);
-
-    res.json(summary);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Erro ao processar o PDF.' });
-  }
-});
-
-app.post('/summarizeChunk', async (req: Request, res: Response) => {
-  if (!req.body.text) {
-    res.status(400).json({ error: 'Nenhum texto enviado.' });
-    return;
-  }
-
-  try {
-    const summary = await summarizeChunk(req.body.text);
-
-    res.json(summary);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Erro ao processar o PDF.' });
-  }
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

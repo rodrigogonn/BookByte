@@ -27,6 +27,7 @@ const ChapterSchema = z.object({
     .int()
     .positive('Página inicial deve ser um número positivo'),
 });
+
 const UploadRequestSchema = z.object({
   chapters: z
     .string()
@@ -136,6 +137,81 @@ app.post(
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: 'Erro ao processar o PDF.' });
+    }
+  }
+);
+
+const SingleChapterSchema = z.object({
+  startPage: z.string().transform((str, ctx) => {
+    const number = Number(str);
+    if (isNaN(number)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Página inicial deve ser um número válido',
+      });
+      return z.NEVER;
+    }
+    return number;
+  }),
+  endPage: z.string().transform((str, ctx) => {
+    const number = Number(str);
+    if (isNaN(number)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Página final deve ser um número válido',
+      });
+      return z.NEVER;
+    }
+    return number;
+  }),
+});
+
+app.post(
+  '/extract-single-chapter',
+  middlewares.adminAuth,
+  upload.single('file'),
+  async (req: Request, res: Response): Promise<void> => {
+    if (!req.file) {
+      res.status(400).json({ error: 'Nenhum arquivo enviado.' });
+      return;
+    }
+
+    try {
+      const result = SingleChapterSchema.safeParse(req.body);
+
+      if (!result.success) {
+        res.status(400).json({
+          error: 'Formato inválido dos dados do capítulo',
+          details: result.error.errors,
+        });
+        return;
+      }
+
+      const { startPage, endPage } = result.data;
+
+      const chapterText = await extractTextFromPdfRange({
+        filePath: req.file.path,
+        startPage,
+        endPage,
+      });
+
+      const compactedChapterText = await compactTextForPrompt(chapterText);
+
+      const chapterFormatted = await summarizeAndFormatChapter(
+        compactedChapterText
+      );
+
+      res.json({
+        originalChapterLength: chapterText.length,
+        compactedChapterLength: chapterFormatted.reduce(
+          (acc, curr) => acc + curr.text.length,
+          0
+        ),
+        chapterFormatted,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Erro ao processar o capítulo do PDF.' });
     }
   }
 );

@@ -45,9 +45,13 @@ export const summarizeChunk = async (text: string): Promise<string> => {
 
 export const summarizeAndFormatChapter = async (
   chapterText: string
-): Promise<Array<object>> => {
+): Promise<
+  Array<{
+    text: string;
+  }>
+> => {
   const prompt = `
-    Pegue o seguinte capítulo dolivro e reestruture-o mantendo **o estilo e a voz original do autor**.
+    Pegue o seguinte capítulo do livro e o condense mantendo **o estilo e a voz original do autor**.
     O resultado deve parecer que foi escrito pelo próprio autor, como uma versão condensada do livro.
     **Não explique a história, apenas reescreva-a com fluidez, mantendo todos os detalhes essenciais.**
 
@@ -85,21 +89,32 @@ export const summarizeAndFormatChapter = async (
 
     **REGRAS OBRIGATÓRIAS SOBRE TAMANHO:**
     - **Use descrições detalhadas, diálogos completos e desenvolvimento de cenas**
-    - **NÃO faça resumos curtos ou superficiais**
+    - Cada parágrafo deve ser extenso, detalhado e conter descrições completas, diálogos e desenvolvimento de cena para manter a riqueza narrativa.
+    - O capitulo condensado deve ter aproximadamente 10% do tamanho original.
 
     **Regras sobre KEY_POINTS:**
-    - Adicione NO MÁXIMO 2 KEY_POINTS. Pode não ter nenhum se não houver momentos/citações/lições realmente significativas.
+    - Pode não ter nenhum se não houver momentos/citações/lições realmente significativas.
     - Insira o KEY_POINT logo após o parágrafo relacionado
     - Inclua a referência nos KEY_POINTS de citação
+    - Se o livro for mais ficção e não passar ensinamentos, não inclua KEY_POINTS INSIGHT.
+    - Só inclua KEY_POINTS INSIGHT se for uma lição de vida ao leitor. Coisas realmente importantes para o leitor refletir. Não coisas sobre a narrativa que nao podem ser aplicadas ao leitor. Insights precisam ser ideias muito relevantes para o leitor.
+      - Se colocar algum insight, verifique se ele é realmente relevante. Se é uma ideia que o leitor vai poder aplicar na sua vida.
+      - Só inclua insights que o livro passa. Não invente insights.
+    - Só inclua KEY_POINTS QUOTE se for uma frase realmente significativa, que agregue valor ao leitor também. Que dê para refletir. Que não dependa de contexto para ser compreendida. Se incluir alguma QUOTE, coloque a frase exatamente como está no texto original.
+      - Se colocar algum quote, verifique se ela é realmente significativa e impactante para o leitor.
+      - Se não for uma frase que isolada do contexto agregue valor ao leitor, não inclua. Se for frase relacionada à narrativa, não inclua. Somente frases que podem ser tiradas do contexto e serem aplicadas nossa vida que importam aqui.
+      - Não coloque narrativas nos QUOTES, apenas frases que um personagem disse, que isoladas que agreguem valor ao leitor.
+      - Ao incluir uma QUOTE, verifique se a frase dela é realmente significativa isolada do contexto e caso não seja, remova.
+    - Só inclua KEY_POINTS MOMENT se for um momento realmente decisivo da história.
 
     **Regras de estrutura:**
-    - **Use o máximo de espaço disponível (até 16k tokens)**
     - **Evite resumos curtos ou generalizações.** O objetivo é condensar, mas sem perder riqueza narrativa.
-    - **Preserve diálogos e descrições completas**
+    - **Preserve diálogos importantes e descrições completas para o entendimento do capítulo.**
     
     **Importante:**  
     - **Ler o capitulo condensado deve passar o mesmo conhecimento que passaria lendo o capítulo original inteiro. Não perca informações importantes e conhecimentos que o livro original passa.**
     - **A narrativa deve ser preservada**, como se fosse um livro condensado, mantendo diálogos, descrições e estrutura original.
+    - **Não perca informações importantes e conhecimentos que o livro original passa.**
 
     **Exemplo de estrutura esperada:**
     {
@@ -112,7 +127,7 @@ export const summarizeAndFormatChapter = async (
           "type": "KEY_POINT",
           "keyPointType": "QUOTE",
           "text": "Não são os anos em sua vida que importam, mas a vida em seus anos.",
-          "reference": "Carta do avô João"
+          "reference": "Avô João"
         },
         {
           "type": "PARAGRAPH",
@@ -139,7 +154,7 @@ export const summarizeAndFormatChapter = async (
     messages: [{ role: 'user', content: prompt }],
     max_tokens: 16000,
     response_format: { type: 'json_object' },
-    temperature: 0.6,
+    temperature: 0.4,
   });
 
   if (!response.choices[0].message.content) {

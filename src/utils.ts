@@ -14,14 +14,42 @@ export const splitText = (text: string, chunkSize: number): string[] => {
 };
 
 const OUTPUT_DIR = './outputs';
-export const saveToFile = async (filename: string, content: string) => {
+
+interface SaveOptions {
+  subDir?: string;
+}
+
+export const saveToFile = async (
+  filename: string,
+  content: string | object,
+  options?: SaveOptions
+) => {
   try {
+    // Cria diretório base
     await fs.mkdir(OUTPUT_DIR, { recursive: true });
-    const filePath = path.join(OUTPUT_DIR, filename);
-    await fs.writeFile(filePath, content, 'utf-8');
-    console.log(`Arquivo salvo: ${filePath}`);
+
+    // Define diretório alvo
+    let targetDir = OUTPUT_DIR;
+    if (options?.subDir) {
+      targetDir = path.join(OUTPUT_DIR, options.subDir);
+      await fs.mkdir(targetDir, { recursive: true });
+    }
+
+    const filePath = path.join(targetDir, filename);
+
+    // Formata o conteúdo baseado na extensão do arquivo
+    const contentToSave =
+      typeof content === 'string' || filename.endsWith('.txt')
+        ? Buffer.from(content.toString(), 'utf-8')
+        : JSON.stringify(content, null, 2);
+
+    await fs.writeFile(filePath, contentToSave);
+    console.log(`✅ Arquivo salvo: ${filePath}`);
+
+    return filePath;
   } catch (error) {
-    console.error('Erro ao salvar arquivo:', error);
+    console.error('❌ Erro ao salvar arquivo:', error);
+    throw error;
   }
 };
 
@@ -71,6 +99,16 @@ export async function extractTextFromPdfRange(
   return data.text;
 }
 
+export const generateProcessId = (): string => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+    2,
+    '0'
+  )}-${String(now.getDate()).padStart(2, '0')}_${String(
+    now.getHours()
+  ).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}`;
+};
+
 const CHUNK_SIZE = 50000;
 export async function compactTextForPrompt(text: string): Promise<string> {
   if (text.length <= MAX_DATA_FOR_PROMPT) {
@@ -119,7 +157,7 @@ export async function compactTextForPrompt(text: string): Promise<string> {
     chunks = splitText(text, CHUNK_SIZE);
   }
 
-  await saveToFile('summary.json', text);
+  await saveToFile('summary.json', text, { subDir: 'temp' });
 
   console.log(
     `Resumo final gerado com ${formatNumber(text.length)} caracteres.`

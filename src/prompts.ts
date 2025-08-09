@@ -4,7 +4,7 @@ import { formatNumber, saveToFile } from './utils';
 import { categories } from './constants/categories';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const model: ChatModel = 'gpt-4o-mini';
+const model: ChatModel = 'gpt-5-mini';
 
 export const summarizeChunk = async (text: string): Promise<string> => {
   const prompt = `
@@ -25,7 +25,7 @@ export const summarizeChunk = async (text: string): Promise<string> => {
   const response = await openai.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: 16000,
+    max_completion_tokens: 16000,
   });
 
   const responseContent = response.choices[0].message.content?.trim();
@@ -43,17 +43,53 @@ export const summarizeChunk = async (text: string): Promise<string> => {
   return responseContent;
 };
 
+const calculateCompressionPercentage = (chapterLength: number): number => {
+  // Ajusta a porcentagem de compressão com base no tamanho do capítulo
+  if (chapterLength > 40000) {
+    return 10; // Capítulos muito grandes podem ser mais comprimidos
+  } else if (chapterLength > 25000) {
+    return 12; // Capítulos grandes
+  } else {
+    return 15; // Capítulos menores
+  }
+};
+
 export const summarizeAndFormatChapter = async (
-  chapterText: string
+  chapterText: string,
+  pageCount: number = 1
 ): Promise<
   Array<{
     text: string;
   }>
 > => {
+  // Usa porcentagem fixa para manter proporcionalidade real entre capítulos
+  const compressionPercentage = calculateCompressionPercentage(
+    chapterText.length
+  );
+  const charactersPerPage = Math.round(chapterText.length / pageCount);
+  const expectedFinalSize = Math.round(
+    (chapterText.length * compressionPercentage) / 100
+  );
+
+  console.log(
+    `Capítulo "${pageCount} páginas, ${formatNumber(
+      chapterText.length
+    )} caracteres (${formatNumber(
+      charactersPerPage
+    )} chars/página)" → ${compressionPercentage}% = ~${formatNumber(
+      expectedFinalSize
+    )} caracteres finais`
+  );
+
   const prompt = `
     Pegue o seguinte capítulo do livro e o condense mantendo **o estilo e a voz original do autor**.
     O resultado deve parecer que foi escrito pelo próprio autor, como uma versão condensada do livro.
     **Não explique a história, apenas reescreva-a com fluidez, mantendo todos os detalhes essenciais.**
+
+    **Regras para o Resumo:**
+    - **Mantenha a essência e os eventos principais sem alterar o significado.**
+    - **Evite simplificações excessivas que alterem o contexto original.**
+    - **Inclua apenas citações que sejam realmente significativas e não misturem narração com falas.**
 
     **Estrutura de Dados:**
     \`\`\`typescript
@@ -90,7 +126,13 @@ export const summarizeAndFormatChapter = async (
     **REGRAS OBRIGATÓRIAS SOBRE TAMANHO:**
     - **Use descrições detalhadas, diálogos completos e desenvolvimento de cenas**
     - Cada parágrafo deve ser extenso, detalhado e conter descrições completas, diálogos e desenvolvimento de cena para manter a riqueza narrativa.
-    - O capitulo condensado deve ter aproximadamente 10% do tamanho original.
+    - O capítulo condensado deve ter aproximadamente ${compressionPercentage}% do tamanho original.
+    - **CRUCIAL**: TODOS os capítulos usam a mesma porcentagem (${compressionPercentage}%), garantindo proporcionalidade real.
+    - **CONTEXTO**: Este capítulo tem ${pageCount} páginas e ${formatNumber(
+    chapterText.length
+  )} caracteres.
+    - **OBJETIVO DE TAMANHO**: Aproximadamente ${expectedFinalSize} caracteres no resultado final.
+    - **PROPORCIONALIDADE**: Capítulos grandes devem gerar resumos grandes, capítulos pequenos geram resumos pequenos - mantendo sempre ${compressionPercentage}%.
 
     **Regras sobre KEY_POINTS:**
     - Pode não ter nenhum se não houver momentos/citações/lições realmente significativas.
@@ -152,9 +194,9 @@ export const summarizeAndFormatChapter = async (
   const response = await openai.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: 16000,
+    max_completion_tokens: 16000,
     response_format: { type: 'json_object' },
-    temperature: 0.4,
+    // temperature: 0.4,
   });
 
   if (!response.choices[0].message.content) {
@@ -193,7 +235,7 @@ export const extractBookInfo = async (
   const response = await openai.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: 1000,
+    max_completion_tokens: 1000,
     response_format: { type: 'json_object' },
   });
 
@@ -234,7 +276,7 @@ export const extractBookCategoriesAndDescription = async (
   const response = await openai.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: 2000,
+    max_completion_tokens: 2000,
     response_format: { type: 'json_object' },
   });
 

@@ -39,6 +39,47 @@ const ChapterSchema = z.object({
     .optional(),
 });
 
+const ChaptersSchema = z
+  .array(ChapterSchema)
+  .min(1, 'Deve haver pelo menos um capítulo')
+  .superRefine((chapters, ctx) => {
+    for (let i = 0; i < chapters.length; i++) {
+      const current = chapters[i];
+
+      if (
+        current.endPage !== undefined &&
+        current.endPage < current.startPage
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Página final deve ser maior ou igual à página inicial',
+          path: [i, 'endPage'],
+        });
+      }
+
+      if (i > 0) {
+        const prev = chapters[i - 1];
+
+        if (current.startPage <= prev.startPage) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: 'startPage deve ser maior que o do capítulo anterior',
+            path: [i, 'startPage'],
+          });
+        }
+
+        if (prev.endPage !== undefined && prev.endPage >= current.startPage) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message:
+              'endPage do capítulo anterior deve ser menor que startPage do próximo capítulo',
+            path: [i - 1, 'endPage'],
+          });
+        }
+      }
+    }
+  });
+
 const UploadRequestSchema = z.object({
   chapters: z
     .string()
@@ -53,7 +94,7 @@ const UploadRequestSchema = z.object({
         return z.NEVER;
       }
     })
-    .pipe(z.array(ChapterSchema).min(1, 'Deve haver pelo menos um capítulo')),
+    .pipe(ChaptersSchema),
 });
 
 interface Book {
@@ -234,30 +275,40 @@ app.post(
   }
 );
 
-const SingleChapterSchema = z.object({
-  startPage: z.string().transform((str, ctx) => {
-    const number = Number(str);
-    if (isNaN(number)) {
+const SingleChapterSchema = z
+  .object({
+    startPage: z.string().transform((str, ctx) => {
+      const number = Number(str);
+      if (isNaN(number)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Página inicial deve ser um número válido',
+        });
+        return z.NEVER;
+      }
+      return number;
+    }),
+    endPage: z.string().transform((str, ctx) => {
+      const number = Number(str);
+      if (isNaN(number)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Página final deve ser um número válido',
+        });
+        return z.NEVER;
+      }
+      return number;
+    }),
+  })
+  .superRefine((data, ctx) => {
+    if (data.endPage < data.startPage) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'Página inicial deve ser um número válido',
+        message: 'endPage deve ser maior ou igual a startPage',
+        path: ['endPage'],
       });
-      return z.NEVER;
     }
-    return number;
-  }),
-  endPage: z.string().transform((str, ctx) => {
-    const number = Number(str);
-    if (isNaN(number)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'Página final deve ser um número válido',
-      });
-      return z.NEVER;
-    }
-    return number;
-  }),
-});
+  });
 
 app.post(
   '/extract-single-chapter',

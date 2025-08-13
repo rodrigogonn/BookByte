@@ -148,6 +148,8 @@ export const summarizeAndFormatChapter = async (
       - Não coloque narrativas nos QUOTES, apenas frases que um personagem disse, que isoladas que agreguem valor ao leitor.
       - Ao incluir uma QUOTE, verifique se a frase dela é realmente significativa isolada do contexto e caso não seja, remova.
     - Só inclua KEY_POINTS MOMENT se for um momento realmente decisivo da história.
+    - NUNCA use o valor null em nenhum campo. Se um campo opcional não existir, omita-o (não inclua a propriedade no JSON).
+    - A propriedade "reference" só deve existir para KEY_POINTS do tipo QUOTE e deve ser uma string não vazia; caso contrário, não inclua "reference".
 
     **Regras de estrutura:**
     - **Evite resumos curtos ou generalizações.** O objetivo é condensar, mas sem perder riqueza narrativa.

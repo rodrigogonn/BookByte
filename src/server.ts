@@ -108,6 +108,85 @@ interface Book {
   categoryIds: number[];
 }
 
+// Função para processar um único capítulo
+async function processChapter(
+  chapter: { title: string; startPage: number; endPage?: number },
+  index: number,
+  chapters: Array<{ title: string; startPage: number; endPage?: number }>,
+  filePath: string,
+  processId: string
+) {
+  const endPage =
+    chapter.endPage ||
+    (index < chapters.length - 1
+      ? chapters[index + 1].startPage - 1
+      : undefined);
+
+  // Extrai texto do PDF
+  const chapterText = await extractTextFromPdfRange({
+    filePath,
+    startPage: chapter.startPage,
+    endPage: endPage,
+  });
+
+  // Salva texto bruto
+  await saveToFile(`${chapter.title}_raw.txt`, chapterText, {
+    subDir: processId,
+  });
+
+  // Compacta texto
+  const compactedChapterText = await compactTextForPrompt(chapterText);
+
+  // Salva texto compactado
+  await saveToFile(`${chapter.title}_compacted.txt`, compactedChapterText, {
+    subDir: processId,
+  });
+
+  // Calcula e salva métricas
+  const pageCount = endPage ? endPage - chapter.startPage + 1 : 1;
+  const metrics = {
+    title: chapter.title,
+    pageCount,
+    originalLength: chapterText.length,
+    compactedLength: compactedChapterText.length,
+    startPage: chapter.startPage,
+    endPage: endPage || 'final',
+    compressionRatio:
+      ((compactedChapterText.length / chapterText.length) * 100).toFixed(2) +
+      '%',
+  };
+
+  await saveToFile(`${chapter.title}_metrics.json`, metrics, {
+    subDir: processId,
+  });
+
+  console.log(
+    `📊 Capítulo "${chapter.title}": ${pageCount} páginas, ${formatNumber(
+      chapterText.length
+    )} caracteres originais, ${formatNumber(
+      compactedChapterText.length
+    )} caracteres após compactação.`
+  );
+
+  // Formata capítulo
+  const chapterFormatted = await summarizeAndFormatChapter(
+    compactedChapterText,
+    pageCount
+  );
+
+  // Salva capítulo formatado
+  await saveToFile(
+    `${chapter.title}_formatted.json`,
+    { title: chapter.title, content: chapterFormatted },
+    { subDir: processId }
+  );
+
+  return {
+    title: chapter.title,
+    content: chapterFormatted,
+  };
+}
+
 app.post(
   '/extract',
   middlewares.adminAuth,
@@ -139,86 +218,40 @@ app.post(
       });
       console.log(`📁 Salvando outputs em: outputs/${processId}`);
 
+      // Opção para processamento paralelo (hardcoded como false para evitar rate limit)
+      const PROCESS_PARALLEL = false;
+
       // Processa cada capítulo
-      const processedChapters = await Promise.all(
-        chapters.map(async (chapter, index) => {
-          const endPage =
-            chapter.endPage ||
-            (index < chapters.length - 1
-              ? chapters[index + 1].startPage - 1
-              : undefined);
+      const processedChapters = [];
 
-          // Extrai texto do PDF
-          const chapterText = await extractTextFromPdfRange({
-            filePath: req.file!.path,
-            startPage: chapter.startPage,
-            endPage: endPage,
-          });
-
-          // Salva texto bruto
-          await saveToFile(`${chapter.title}_raw.txt`, chapterText, {
-            subDir: processId,
-          });
-
-          // Compacta texto
-          const compactedChapterText = await compactTextForPrompt(chapterText);
-
-          // Salva texto compactado
-          await saveToFile(
-            `${chapter.title}_compacted.txt`,
-            compactedChapterText,
-            { subDir: processId }
-          );
-
-          // Calcula e salva métricas
-          const pageCount = endPage ? endPage - chapter.startPage + 1 : 1;
-          const metrics = {
-            title: chapter.title,
-            pageCount,
-            originalLength: chapterText.length,
-            compactedLength: compactedChapterText.length,
-            startPage: chapter.startPage,
-            endPage: endPage || 'final',
-            compressionRatio:
-              (
-                (compactedChapterText.length / chapterText.length) *
-                100
-              ).toFixed(2) + '%',
-          };
-
-          await saveToFile(`${chapter.title}_metrics.json`, metrics, {
-            subDir: processId,
-          });
-
+      if (PROCESS_PARALLEL) {
+        // Processamento paralelo (pode exceder rate limit)
+        const parallelResults = await Promise.all(
+          chapters.map(async (chapter, index) =>
+            processChapter(chapter, index, chapters, req.file!.path, processId)
+          )
+        );
+        processedChapters.push(...parallelResults);
+      } else {
+        // Processamento sequencial (evita rate limit)
+        for (let index = 0; index < chapters.length; index++) {
+          const chapter = chapters[index];
           console.log(
-            `📊 Capítulo "${
+            `🔄 Processando capítulo ${index + 1}/${chapters.length}: "${
               chapter.title
-            }": ${pageCount} páginas, ${formatNumber(
-              chapterText.length
-            )} caracteres originais, ${formatNumber(
-              compactedChapterText.length
-            )} caracteres após compactação.`
+            }"`
           );
 
-          // Formata capítulo
-          const chapterFormatted = await summarizeAndFormatChapter(
-            compactedChapterText,
-            pageCount
+          const processedChapter = await processChapter(
+            chapter,
+            index,
+            chapters,
+            req.file!.path,
+            processId
           );
-
-          // Salva capítulo formatado
-          await saveToFile(
-            `${chapter.title}_formatted.json`,
-            { title: chapter.title, content: chapterFormatted },
-            { subDir: processId }
-          );
-
-          return {
-            title: chapter.title,
-            content: chapterFormatted,
-          };
-        })
-      );
+          processedChapters.push(processedChapter);
+        }
+      }
 
       // Extrai e salva texto completo do livro
       const bookText = await extractTextFromPdfRange({

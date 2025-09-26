@@ -4,6 +4,7 @@ import { PDFDocument } from 'pdf-lib';
 import pdfParse from 'pdf-parse';
 import { MAX_DATA_FOR_PROMPT } from './constants/prompt';
 import { summarizeChunk } from './prompts';
+import { encoding_for_model, get_encoding, TiktokenModel } from 'tiktoken';
 
 export const splitText = (text: string, chunkSize: number): string[] => {
   let chunks = [];
@@ -112,13 +113,20 @@ export const generateProcessId = (): string => {
 const CHUNK_SIZE = 50000;
 export async function compactTextForPrompt(text: string): Promise<string> {
   if (text.length <= MAX_DATA_FOR_PROMPT) {
+    console.log(
+      `Texto inicial (${formatNumber(
+        text.length
+      )} caracteres) cabe dentro do limite. Retornando texto original.`
+    );
     return text;
   }
 
   let chunks = splitText(text, CHUNK_SIZE);
 
   console.log(
-    `Texto inicial dividido em ${formatNumber(chunks.length)} partes.`
+    `Texto inicial (${formatNumber(
+      text.length
+    )} caracteres) dividido em ${formatNumber(chunks.length)} partes.`
   );
 
   while (text.length > MAX_DATA_FOR_PROMPT) {
@@ -163,4 +171,140 @@ export async function compactTextForPrompt(text: string): Promise<string> {
     `Resumo final gerado com ${formatNumber(text.length)} caracteres.`
   );
   return text;
+}
+
+// ===== Tokenização e segmentação por tokens (elástica) =====
+
+export function countTokens(text: string, model: TiktokenModel): number {
+  let enc;
+  try {
+    enc = encoding_for_model(model);
+  } catch {
+    enc = get_encoding('o200k_base');
+  }
+  const n = enc.encode(text).length;
+  enc.free();
+  return n;
+}
+
+function getEncoder(model: TiktokenModel) {
+  try {
+    return encoding_for_model(model);
+  } catch {
+    return get_encoding('o200k_base');
+  }
+}
+
+function isSentenceEnd(ch: string) {
+  return /[.!?]/.test(ch);
+}
+
+/**
+ * Divide um texto por tokens com janelas elásticas, respeitando parágrafos/frases
+ * e adicionando overlap em caracteres proporcional ao overlap de tokens desejado.
+ */
+export function splitByTokensElastic(
+  text: string,
+  targetTokens = 6000,
+  overlapTokens = 600,
+  tolerance = 0.15 // ±15%
+): {
+  chunks: string[];
+  boundaries: Array<{ start: number; end: number; tokens: number }>;
+} {
+  const enc = getEncoder('gpt-5-mini');
+  const tokens = enc.encode(text);
+  const maxTokens = Math.max(100, Math.round(targetTokens * (1 + tolerance)));
+  const minTokens = Math.max(50, Math.round(targetTokens * (1 - tolerance)));
+  const result: string[] = [];
+  const boundaries: Array<{ start: number; end: number; tokens: number }> = [];
+
+  let startTok = 0;
+  while (startTok < tokens.length) {
+    const endTarget = Math.min(tokens.length, startTok + targetTokens);
+    let endTok = Math.min(
+      tokens.length,
+      endTarget + Math.round(targetTokens * tolerance)
+    );
+
+    // converte índices de tokens para índices de caracteres
+    const startChar = enc.decode(tokens.slice(0, startTok)).length;
+    const maxChar = enc.decode(tokens.slice(0, endTok)).length;
+
+    // janela para buscar melhor corte
+    const windowStartTok = Math.max(
+      0,
+      endTarget - Math.round(targetTokens * tolerance)
+    );
+    const windowStartChar = enc.decode(tokens.slice(0, windowStartTok)).length;
+    const slice = text.slice(windowStartChar, maxChar);
+
+    // prioriza fim de parágrafo
+    let bestCut = maxChar;
+    let idx = slice.lastIndexOf('\n\n');
+    if (idx !== -1) {
+      bestCut = windowStartChar + idx;
+    } else {
+      // tenta fim de frase
+      for (let i = slice.length - 1; i >= 0; i--) {
+        if (isSentenceEnd(slice[i])) {
+          bestCut = windowStartChar + i + 1;
+          break;
+        }
+      }
+    }
+
+    if (bestCut <= startChar) bestCut = maxChar;
+
+    const piece = text.slice(startChar, bestCut).trim();
+    const pieceTokens = enc.encode(piece).length;
+
+    // Proteção contra chunk vazio
+    if (pieceTokens === 0 || piece.length === 0) {
+      if (startTok >= tokens.length) break;
+      startTok = Math.min(
+        tokens.length,
+        startTok + Math.max(1, Math.round(targetTokens * 0.5))
+      );
+      continue;
+    }
+
+    // se ficou curto demais, estende um pouco
+    if (pieceTokens < minTokens && bestCut < text.length) {
+      const extraEnd = Math.min(
+        text.length,
+        bestCut + Math.round(piece.length * 0.2)
+      );
+      const extended = text.slice(startChar, extraEnd);
+      result.push(extended.trim());
+      boundaries.push({
+        start: startChar,
+        end: extraEnd,
+        tokens: enc.encode(extended).length,
+      });
+      // calcula próximo start com overlap aproximado
+      const overlapChars = Math.round(
+        extended.length * (overlapTokens / Math.max(1, pieceTokens))
+      );
+      const nextStartChar = Math.max(
+        startChar + extended.length - overlapChars,
+        startChar + 1
+      );
+      startTok = enc.encode(text.slice(0, nextStartChar)).length;
+    } else {
+      result.push(piece);
+      boundaries.push({ start: startChar, end: bestCut, tokens: pieceTokens });
+      const overlapChars = Math.round(
+        piece.length * (overlapTokens / Math.max(1, pieceTokens))
+      );
+      const nextStartChar = Math.max(
+        startChar + piece.length - overlapChars,
+        startChar + 1
+      );
+      startTok = enc.encode(text.slice(0, nextStartChar)).length;
+    }
+  }
+
+  enc.free();
+  return { chunks: result, boundaries };
 }

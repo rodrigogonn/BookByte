@@ -1,6 +1,6 @@
 import { OpenAI } from 'openai';
 import { ChatModel } from 'openai/resources';
-import { formatNumber, saveToFile } from './utils';
+import { formatNumber, saveToFile, countTokens } from './utils';
 import { categories } from './constants/categories';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -198,7 +198,6 @@ export const summarizeAndFormatChapter = async (
     messages: [{ role: 'user', content: prompt }],
     max_completion_tokens: 16000,
     response_format: { type: 'json_object' },
-    // temperature: 0.4,
   });
 
   if (!response.choices[0].message.content) {
@@ -289,3 +288,452 @@ export const extractBookCategoriesAndDescription = async (
   const bookCategories = JSON.parse(response.choices[0].message.content);
   return bookCategories;
 };
+
+// ===== Tipagens de saída (reaproveitando a estrutura existente e adicionando metadados) =====
+
+export enum ContentType {
+  PARAGRAPH = 'PARAGRAPH',
+  KEY_POINT = 'KEY_POINT',
+}
+
+export enum KeyPointType {
+  QUOTE = 'QUOTE',
+  INSIGHT = 'INSIGHT',
+  MOMENT = 'MOMENT',
+}
+
+export interface Paragraph {
+  type: ContentType.PARAGRAPH;
+  text: string;
+}
+
+export interface KeyPoint {
+  type: ContentType.KEY_POINT;
+  keyPointType: KeyPointType;
+  text: string;
+  reference?: string; // Obrigatório apenas quando QUOTE
+}
+
+export type ChapterContent = Paragraph | KeyPoint;
+
+export interface Chapter {
+  content: ChapterContent[];
+}
+
+export interface ChapterWithMeta extends Chapter {
+  title: string;
+  summaryForNext: string; // 100–200 tokens a serem lembrados no próximo capítulo
+}
+
+// ===== Guia Global (map-reduce) =====
+
+export interface GlobalGuide {
+  characters: Array<{ name: string; aliases?: string[]; role?: string }>;
+  locations: string[];
+  terms: string[];
+  timeline: Array<{ order: number; event: string }>;
+  themes: string[];
+  style: { voice: string; tone: string };
+}
+
+export async function buildGlobalGuide(
+  chunks: string[],
+  options?: { subDir?: string; polishTargetTokens?: number }
+): Promise<GlobalGuide> {
+  const maps: GlobalGuide[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const ctext = chunks[i];
+    const ctokens = countTokens(ctext, 'gpt-5-mini');
+    console.log(
+      `🧭 [GUIA] Chunk ${i + 1}/${chunks.length}: ${formatNumber(
+        ctext.length
+      )} chars, ${formatNumber(ctokens)} tokens`
+    );
+    await saveToFile(
+      `guide_input_${String(i + 1).padStart(2, '0')}.txt`,
+      ctext,
+      { subDir: options?.subDir }
+    );
+    const prompt = `
+      Você é um analista literário. Extraia um guia CONCISO do trecho abaixo, retornando JSON:
+      {
+        "characters": [{"name": "...", "aliases": ["..."], "role": "..."}],
+        "locations": ["..."],
+        "terms": ["..."] ,
+        "timeline": [{"order": 1, "event": "..."}],
+        "themes": ["..."],
+        "style": {"voice": "...", "tone": "..."}
+      }
+      Limites por seção (apenas itens realmente relevantes do trecho):
+      - characters ≤ 8; locations ≤ 8; terms ≤ 10; timeline ≤ 8 eventos curtos; themes ≤ 5; style ≤ 2 frases curtas.
+      Se uma seção não tiver itens relevantes, retorne um array vazio para ela.
+      Evite duplicar variações triviais (com artigos, plural/singular). Não invente.
+
+      Trecho:
+      """
+      ${ctext}
+      """
+    `;
+    // Requisição robusta com retries
+    let parsed: GlobalGuide | null = null;
+    let attempt = 0;
+    const maxAttempts = 3;
+    while (attempt < maxAttempts && !parsed) {
+      attempt++;
+      try {
+        const resp = await openai.chat.completions.create({
+          model,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.',
+            },
+            { role: 'user', content: prompt },
+          ],
+          max_completion_tokens: 8000,
+          response_format: { type: 'json_object' },
+        });
+        const content = resp.choices[0].message.content;
+        if (!content) {
+          await saveToFile(
+            `guide_chunk_${String(i + 1).padStart(
+              2,
+              '0'
+            )}_resp_attempt${attempt}.json`,
+            JSON.stringify(resp, null, 2),
+            { subDir: options?.subDir }
+          );
+          throw new Error('Resposta vazia do modelo');
+        }
+        parsed = JSON.parse(content);
+        await saveToFile(
+          `guide_output_${String(i + 1).padStart(2, '0')}.json`,
+          JSON.stringify(parsed, null, 2),
+          { subDir: options?.subDir }
+        );
+      } catch (e) {
+        console.error(
+          `❌ [GUIA] Erro no chunk ${i + 1} (tentativa ${attempt}):`,
+          e
+        );
+        if (attempt >= maxAttempts) throw e;
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    }
+    maps.push(parsed!);
+  }
+
+  // Agregação raw (sem normalização por código) e renumeração da timeline
+  const guideRaw: GlobalGuide = {
+    characters: maps.flatMap((m) => m.characters || []),
+    locations: maps.flatMap((m) => m.locations || []),
+    terms: maps.flatMap((m) => m.terms || []),
+    timeline: maps
+      .flatMap((m) => m.timeline || [])
+      .filter((e) => e?.event)
+      .map((e, i) => ({ order: i + 1, event: e.event })),
+    themes: maps.flatMap((m) => m.themes || []),
+    style: maps.find((m) => m?.style)?.style || {
+      voice: 'neutro',
+      tone: 'neutro',
+    },
+  };
+
+  await saveToFile('book_global_guide_raw.json', guideRaw, {
+    subDir: options?.subDir,
+  });
+  const guideRawStr = JSON.stringify(guideRaw);
+  console.log(
+    `🧭 [GUIA] Agregado (raw): ${formatNumber(
+      guideRawStr.length
+    )} chars, ${formatNumber(countTokens(guideRawStr, 'gpt-5-mini'))} tokens`
+  );
+
+  // Polimento final via LLM para dedupe/compactação
+  const polished = await polishGlobalGuide(
+    guideRaw,
+    options?.polishTargetTokens ?? 3500,
+    options?.subDir
+  );
+  await saveToFile('book_global_guide.json', polished, {
+    subDir: options?.subDir,
+  });
+  const polishedStr = JSON.stringify(polished);
+  console.log(
+    `🧭 [GUIA] Polido: ${formatNumber(
+      polishedStr.length
+    )} chars, ${formatNumber(countTokens(polishedStr, 'gpt-5-mini'))} tokens`
+  );
+  return polished;
+}
+
+async function polishGlobalGuide(
+  guide: GlobalGuide,
+  targetTokens: number,
+  subDir?: string
+): Promise<GlobalGuide> {
+  const prompt = `
+    Receba um guia global (JSON) e devolva-o deduplicado e mais conciso:
+    - Unifique personagens duplicados (variações de grafia, artigos/parênteses) sob um nome canônico curto; mantenha aliases.
+    - Remova locais/termos redundantes.
+    - Renumere timeline de 1..N, no máximo 250 eventos curtos, sem repetição.
+    - Mantenha chaves: characters, locations, terms, timeline, themes, style.
+    - Tente ~${targetTokens} tokens. Não invente fatos.
+    Retorne somente JSON válido.
+
+    GUIA:
+    """
+    ${JSON.stringify(guide)}
+    """
+  `;
+
+  let parsed: GlobalGuide | null = null;
+  let attempt = 0;
+  const maxAttempts = 2;
+  while (attempt < maxAttempts && !parsed) {
+    attempt++;
+    try {
+      const resp = await openai.chat.completions.create({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.',
+          },
+          { role: 'user', content: prompt },
+        ],
+        max_completion_tokens: 8000,
+        response_format: { type: 'json_object' },
+      });
+      const content = resp.choices[0].message.content;
+      if (!content) {
+        await saveToFile(
+          `guide_polish_resp_attempt${attempt}.json`,
+          JSON.stringify(resp, null, 2),
+          { subDir }
+        );
+        throw new Error('Resposta vazia ao polir guia');
+      }
+      parsed = JSON.parse(content);
+      await saveToFile(
+        'book_global_guide_polish_output.json',
+        JSON.stringify(parsed, null, 2),
+        { subDir }
+      );
+    } catch (e) {
+      console.error(`❌ [GUIA] Erro ao polir (tentativa ${attempt}):`, e);
+      if (attempt >= maxAttempts) throw e;
+      await new Promise((r) => setTimeout(r, attempt * 1000));
+    }
+  }
+  await saveToFile('book_global_guide_polish_input.json', prompt, { subDir });
+  return parsed!;
+}
+
+// ===== Resumo com contexto e limite de KEY_POINTS =====
+
+export type ChapterOutput = ChapterWithMeta;
+
+function sanitizeChapterOutput(ch: ChapterOutput): ChapterOutput {
+  const sanitizedContent = (ch.content || []).map((item: any) => {
+    // remove chaves com null
+    Object.keys(item).forEach((k) => {
+      if (item[k] === null) delete item[k];
+    });
+    return item;
+  });
+  const sanitized: ChapterOutput = {
+    title: typeof ch.title === 'string' ? ch.title : '',
+    content: sanitizedContent,
+    summaryForNext:
+      typeof ch.summaryForNext === 'string' ? ch.summaryForNext : '',
+  };
+  return sanitized;
+}
+
+export async function summarizeChapterWithContext(args: {
+  chapterText: string;
+  guide: GlobalGuide;
+  prevSummary?: string;
+  targetTokens?: number;
+  options?: { subDir?: string };
+}): Promise<ChapterOutput> {
+  const { chapterText, guide, prevSummary, targetTokens = 900, options } = args;
+
+  // Logs de contexto
+  const inTokens = countTokens(chapterText, 'gpt-5-mini');
+  const prevTokens = prevSummary ? countTokens(prevSummary, 'gpt-5-mini') : 0;
+  const guideTokens = countTokens(JSON.stringify(guide), 'gpt-5-mini');
+  const effectiveTarget = Math.max(100, Math.round(targetTokens * 0.45));
+  console.log(
+    `✂️  [CAP] Entrada: ${formatNumber(
+      chapterText.length
+    )} chars, ${formatNumber(inTokens)} tokens | prev: ${formatNumber(
+      prevTokens
+    )} tokens | guia: ${formatNumber(
+      guideTokens
+    )} tokens | alvo saída: ~${formatNumber(
+      targetTokens
+    )} tokens (efetivo ~${formatNumber(effectiveTarget)})`
+  );
+
+  const prompt = `
+    Você vai condensar um trecho do livro em um capítulo de saída coeso (início, meio, fim).
+    Mantenha o estilo e a voz original do autor. O resultado deve soar como escrito pelo próprio autor, apenas mais conciso.
+    Não explique a história em metacomentários; reescreva com fluidez, preservando os detalhes essenciais e a experiência de leitura.
+    Use o GUIA GLOBAL e o microresumo anterior para manter consistência de nomes, lugares, tom e continuidade.
+
+    GUIA GLOBAL (canônico e conciso):
+    ${JSON.stringify(guide)}
+
+    MICRORESUMO ANTERIOR (se existir):
+    ${prevSummary || 'N/A'}
+
+    INSTRUÇÕES ESTRUTURAIS:
+    - Comece com 1–2 frases de ANCORAGEM se o trecho começar no meio (quem/onde/objetivo), sem inventar fatos.
+    - Preserve diálogos importantes; evite quebrar falas.
+    - Termine com FECHAMENTO claro: estado atual, pendências, próximo objetivo imediato.
+    - Alvo de tamanho: ~${effectiveTarget} tokens. É preferível ficar ABAIXO do alvo do que acima. Ao se aproximar do limite, finalize o parágrafo em curso e encerre.
+    - Não escreva rótulos como "ANCORAGEM:", "Âncora:", "Fechamento:", "Conclusão:" ou similares. Integre ancoragem e fechamento como parte natural da narrativa, sem cabeçalhos.
+    - Não use cabeçalhos, marcadores, listas ou prefixos técnicos no corpo. Produza apenas parágrafos narrativos (e KEY_POINTS conforme a estrutura), sem títulos internos.
+    - Título: gere um título curto e descritivo SEM prefixos como "Capítulo", números ou travessões. Ex.: "Uma festa inesperada" (não use "Capítulo I — ...").
+    - KEY_POINTS: até 3 (0, 1, 2 ou 3). Inclua apenas se agregarem valor real e INSIRA cada KEY_POINT imediatamente após o parágrafo relacionado (não agrupe todos no final):
+      - INSIGHT: apenas lições universais aplicáveis ao leitor; evite explicar a narrativa.
+      - QUOTE: somente se TODOS os critérios abaixo forem verdadeiros (senão, NÃO inclua QUOTE):
+        1) Autossuficiente: funciona fora do contexto (entende-se sozinha).
+        2) Memorável/reflexiva: provoca insight/ponderação (aforística, não banal).
+        3) Universalidade: trata de temas gerais (vida, tempo, escolha, coragem, etc.).
+        4) Linguagem adequada: sem vulgaridade/insulto gratuito.
+        5) Referência correta: "reference" = quem falou (personagem/narrador), nunca capítulo/seção/página. Se não souber, NÃO inclua QUOTE.
+      - MOMENT: apenas momentos genuinamente decisivos.
+    - Evite redundância entre parágrafos e KEY_POINTS: se uma fala virar QUOTE, NÃO repita a mesma frase literalmente no parágrafo.
+    - Se não houver KEY_POINTS realmente bons, retorne ZERO key points (é aceitável 0).
+    - NUNCA use null; omita campos opcionais inexistentes.
+    - Mantenha proporções ricas: parágrafos longos e detalhados; evite virar “resumo telegráfico”.
+
+    ESTRUTURA DE DADOS (tipagens):
+    \`\`\`typescript
+    enum ContentType {
+      PARAGRAPH = 'PARAGRAPH',
+
+      KEY_POINT = 'KEY_POINT'
+    }
+
+    enum KeyPointType {
+      QUOTE = 'QUOTE',
+      INSIGHT = 'INSIGHT',
+      MOMENT = 'MOMENT'
+    }
+
+    interface Paragraph {
+      type: ContentType.PARAGRAPH;
+      text: string;
+    }
+
+    interface KeyPoint {
+      type: ContentType.KEY_POINT;
+      
+      keyPointType: KeyPointType;
+      text: string;
+      reference?: string; // Para QUOTE: quem falou (personagem/narrador). Nunca use nomes de capítulo/seção. Se não souber, omita.
+    }
+
+    type ChapterContent = Paragraph | KeyPoint;
+
+    interface Chapter {
+      content: ChapterContent[];
+    }
+
+    interface ChapterWithMeta extends Chapter {
+      title: string;
+      summaryForNext: string; // 100–200 tokens
+    }
+    \`\`\`
+
+    FORMATO DE SAÍDA (JSON): deve ser um \"ChapterWithMeta\" válido.
+
+    TEXTO DO CAPÍTULO (já contém pequena sobreposição com o anterior e o próximo):
+    """
+    ${chapterText}
+    """
+  `;
+
+  // Persistir prompt para debug
+  await saveToFile('chapter_prompt.txt', prompt, { subDir: options?.subDir });
+
+  let parsed: ChapterOutput | null = null;
+  let attemptCap = 0;
+  const maxAttemptsCap = 3;
+  while (attemptCap < maxAttemptsCap && !parsed) {
+    attemptCap++;
+    try {
+      const response = await openai.chat.completions.create({
+        model,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.',
+          },
+          { role: 'user', content: prompt },
+        ],
+        max_completion_tokens: Math.max(
+          8000,
+          Math.round(effectiveTarget * 1.5)
+        ),
+        response_format: { type: 'json_object' },
+      });
+      const content = response.choices[0].message.content;
+      if (!content) {
+        await saveToFile(
+          `chapter_resp_attempt${attemptCap}.json`,
+          JSON.stringify(response, null, 2),
+          { subDir: options?.subDir }
+        );
+        throw new Error('Nenhum conteúdo retornado pelo modelo');
+      }
+      parsed = sanitizeChapterOutput(JSON.parse(content));
+      await saveToFile(
+        `chapter_output_attempt${attemptCap}.json`,
+        JSON.stringify(parsed, null, 2),
+        { subDir: options?.subDir }
+      );
+    } catch (e) {
+      console.error(`❌ [CAP] Erro ao resumir (tentativa ${attemptCap}):`, e);
+      await saveToFile(`chapter_error_attempt${attemptCap}.txt`, String(e), {
+        subDir: options?.subDir,
+      });
+      if (attemptCap >= maxAttemptsCap) throw e;
+      await new Promise((r) => setTimeout(r, attemptCap * 1000));
+    }
+  }
+  // Garantia de não-nulo
+  if (!parsed) {
+    throw new Error('Falha ao gerar capítulo após múltiplas tentativas');
+  }
+  // Métricas de saída
+  const outText = (parsed.content || [])
+    .map((c: { text: string }) => c.text)
+    .join('\n\n');
+  const outTokens = countTokens(outText, 'gpt-5-mini');
+  const kpCount = (parsed.content || []).filter(
+    (c: { type: string }) => c.type === 'KEY_POINT'
+  ).length;
+  console.log(
+    `✅ [CAP] Título: ${
+      parsed.title || '(sem título)'
+    } | Parágrafos: ${formatNumber(
+      (parsed.content || []).filter(
+        (c: { type: string }) => c.type === 'PARAGRAPH'
+      ).length
+    )} | KeyPoints: ${kpCount} | Saída: ${formatNumber(
+      outText.length
+    )} chars, ${formatNumber(outTokens)} tokens`
+  );
+  await saveToFile('chapter_formatted.json', parsed, {
+    subDir: options?.subDir,
+  });
+  return parsed;
+}

@@ -13,6 +13,7 @@ import {
   generateProcessId,
   countTokens,
   splitByTokensElastic,
+  computeChapterSegmentationParams,
 } from './utils';
 import {
   extractBookCategoriesAndDescription,
@@ -20,6 +21,8 @@ import {
   summarizeAndFormatChapter,
   buildGlobalGuide,
   summarizeChapterWithContext,
+  Chapter,
+  GlobalGuide,
 } from './prompts';
 import { z } from 'zod';
 import { MAX_DATA_FOR_PROMPT } from './constants/prompt';
@@ -28,6 +31,29 @@ import cors from 'cors';
 
 const app = express();
 const upload = multer({ dest: 'uploads/' });
+
+// Arquivos padrão centralizados
+const FILES = {
+  bookFinal: 'book_final.json',
+  bookInfo: 'book_info.json',
+  bookComplete: 'book_complete.txt',
+  chapterBoundaries: 'chapter_boundaries.json',
+  bookGlobalGuide: 'book_global_guide.json',
+  guideChunksCount: 'guide_chunks_count.txt',
+  guideChunksStats: 'guide_chunks_stats.json',
+};
+
+// Utilitários de nome de diretório reutilizáveis
+const stripDiacritics = (s: string) =>
+  (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+const sanitizeDirName = (name: string) =>
+  stripDiacritics(name)
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/[^\w\s\-\.\(\)&]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+const extractBaseIdFromProcessDir = (dir: string) => (dir || '').split(' (')[0];
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -194,6 +220,336 @@ async function processChapter(
 }
 
 app.post(
+  '/rerun-categories-from-outputs',
+  middlewares.adminAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const bodySchema = z.object({
+        processDir: z.string().min(1, 'processDir é obrigatório'),
+      });
+      const parsed = bodySchema.safeParse(req.body);
+      if (!parsed.success) {
+        res
+          .status(400)
+          .json({ error: 'Dados inválidos', details: parsed.error.errors });
+        return;
+      }
+
+      const { processDir } = parsed.data;
+      const baseDir = path.join('outputs', processDir);
+
+      // Lê book_final.json existente
+      const bookFinalPath = path.join(baseDir, 'book_final.json');
+      const bookFinalStr = await fs.readFile(bookFinalPath, 'utf-8');
+      const bookFinal = JSON.parse(bookFinalStr);
+
+      // Recalcula categorias e descrição a partir de book_data ou book_final
+      const bookDataLike = {
+        title: bookFinal.title,
+        author: bookFinal.author,
+        chapters: bookFinal.chapters,
+      };
+      const rerunId = `rerun_${generateProcessId()}`;
+      const rerunSubDir = path.join(processDir, rerunId);
+      const { categoryIds, description } =
+        await extractBookCategoriesAndDescription(
+          JSON.stringify(bookDataLike),
+          { subDir: rerunSubDir }
+        );
+
+      // Atualiza e salva novo book_final no subdiretório de rerun
+      const updated = { ...bookFinal, categoryIds, description };
+      await saveToFile('book_final.json', updated, { subDir: rerunSubDir });
+      await saveToFile(
+        'rerun_info.json',
+        {
+          sourceProcessDir: processDir,
+          rerunId,
+          action: 'rerun_categories',
+          timestamp: new Date().toISOString(),
+        },
+        { subDir: rerunSubDir }
+      );
+
+      res.json({
+        saved: true,
+        outputDir: path.join('outputs', rerunSubDir),
+        categoryIds,
+        description,
+      });
+    } catch (error) {
+      console.error(error);
+      res
+        .status(500)
+        .json({ error: 'Erro ao recalcular categorias/descrição do livro.' });
+    }
+  }
+);
+
+// Retoma um processamento anterior e continua do capítulo seguinte ao último salvo
+app.post(
+  '/resume-extract-auto',
+  middlewares.adminAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const bodySchema = z.object({
+        processDir: z.string().min(1, 'processDir é obrigatório'),
+      });
+
+      const parsed = bodySchema.safeParse(req.body);
+      if (!parsed.success) {
+        res
+          .status(400)
+          .json({ error: 'Dados inválidos', details: parsed.error.errors });
+        return;
+      }
+
+      const { processDir } = parsed.data;
+
+      const baseDir = path.join('outputs', processDir);
+      // Leitura de artefatos necessários
+      // Leitura obrigatória: texto completo
+      const bookTxt = await fs.readFile(
+        path.join(baseDir, FILES.bookComplete),
+        'utf-8'
+      );
+      const bookText = bookTxt.toString();
+
+      // Tenta ler guia e fronteiras; se ausentes, gera (mesma lógica do extract-auto)
+      let guide: GlobalGuide;
+      try {
+        const guideStr = await fs.readFile(
+          path.join(baseDir, FILES.bookGlobalGuide),
+          'utf-8'
+        );
+        guide = JSON.parse(guideStr.toString());
+      } catch {
+        // Gera guia a partir do texto completo (mesmos parâmetros do extract-auto)
+        const GUIDE_INPUT_TOKENS = 26000;
+        const GUIDE_OVERLAP_TOKENS = 1000;
+        const guideChunks = splitByTokensElastic(
+          bookText,
+          GUIDE_INPUT_TOKENS,
+          GUIDE_OVERLAP_TOKENS
+        );
+        await saveToFile(
+          FILES.guideChunksCount,
+          `chunks: ${guideChunks.chunks.length}`,
+          { subDir: processDir }
+        );
+        const guideStats = guideChunks.chunks.map((c, i) => ({
+          index: i + 1,
+          chars: c.length,
+          tokens: countTokens(c, 'gpt-5-mini'),
+        }));
+        await saveToFile(FILES.guideChunksStats, guideStats, {
+          subDir: processDir,
+        });
+        guide = await buildGlobalGuide(guideChunks.chunks, {
+          subDir: processDir,
+        });
+        await saveToFile(FILES.bookGlobalGuide, guide, {
+          subDir: processDir,
+        });
+      }
+
+      let boundaries: Array<{ start: number; end: number; tokens: number }>;
+      try {
+        const boundariesStr = await fs.readFile(
+          path.join(baseDir, FILES.chapterBoundaries),
+          'utf-8'
+        );
+        boundaries = JSON.parse(boundariesStr.toString());
+      } catch {
+        // Gera fronteiras se ausente
+        const totalBookTokens = countTokens(bookText, 'gpt-5-mini');
+        const {
+          chapterInputTokens: CHAPTER_INPUT_TOKENS,
+          chapterOverlapTokens: CHAPTER_OVERLAP_TOKENS,
+        } = computeChapterSegmentationParams(totalBookTokens);
+        const { boundaries: newBoundaries } = splitByTokensElastic(
+          bookText,
+          CHAPTER_INPUT_TOKENS,
+          CHAPTER_OVERLAP_TOKENS
+        );
+        boundaries = newBoundaries;
+        await saveToFile(FILES.chapterBoundaries, boundaries, {
+          subDir: processDir,
+        });
+      }
+
+      // Descobre último capítulo salvo contínuo (chapter_01, chapter_02, ...)
+      let lastIdx = 0; // zero-based do último já existente
+      for (let i = 1; i <= boundaries.length; i++) {
+        const fname = `chapter_${String(i).padStart(2, '0')}_formatted.json`;
+        try {
+          await fs.access(path.join(baseDir, fname));
+          lastIdx = i; // i existe (1-based)
+        } catch {
+          break; // primeiro ausente
+        }
+      }
+
+      if (lastIdx >= boundaries.length) {
+        // Nada a fazer; já completo
+        res.json({
+          message: 'Processo já concluído. Nenhum capítulo pendente.',
+        });
+        return;
+      }
+
+      console.log(
+        `⏯️ Retomando processamento em ${processDir} a partir do capítulo ${
+          lastIdx + 1
+        }/${boundaries.length}`
+      );
+
+      // Prev capítulo formatado (se houver)
+      let prevChapterFormatted: Chapter | undefined;
+      if (lastIdx > 0) {
+        try {
+          const prevStr = await fs.readFile(
+            path.join(
+              baseDir,
+              `chapter_${String(lastIdx).padStart(2, '0')}_formatted.json`
+            ),
+            'utf-8'
+          );
+          const prevJson = JSON.parse(prevStr);
+          if (prevJson && Array.isArray(prevJson.content)) {
+            prevChapterFormatted = {
+              title: prevJson.title || '',
+              content: prevJson.content,
+            };
+          }
+        } catch {}
+      }
+
+      // Itera capítulos pendentes
+      for (let idx = lastIdx; idx < boundaries.length; idx++) {
+        const { start, end } = boundaries[idx];
+        const chapterText = bookText.slice(start, end);
+        console.log(
+          `🔄 [RESUME] Capítulo ${idx + 1}/${
+            boundaries.length
+          } | ${formatNumber(chapterText.length)} chars, ${formatNumber(
+            countTokens(chapterText, 'gpt-5-mini')
+          )} tokens`
+        );
+
+        const out = await summarizeChapterWithContext({
+          chapterText,
+          guide,
+          prevChapterFormatted,
+          targetTokens: 800,
+          options: { subDir: processDir, chapterIndex: idx },
+        });
+
+        // Atualiza prev para próximo
+        prevChapterFormatted = { title: out.title, content: out.content };
+
+        await saveToFile(
+          `chapter_${String(idx + 1).padStart(2, '0')}_formatted.json`,
+          { title: out.title, content: out.content },
+          { subDir: processDir }
+        );
+      }
+
+      // Recompõe capítulos finais em ordem
+      const allChapters: Array<{ title: string; content: object[] }> = [];
+      for (let i = 1; i <= boundaries.length; i++) {
+        const str = await fs.readFile(
+          path.join(
+            baseDir,
+            `chapter_${String(i).padStart(2, '0')}_formatted.json`
+          ),
+          'utf-8'
+        );
+        const js = JSON.parse(str);
+        allChapters.push({ title: js.title, content: js.content });
+      }
+
+      // Garante metadados (title/author); se inexistente, extrai a partir de amostra
+      let title = '';
+      let author = '';
+      try {
+        const infoStr = await fs.readFile(
+          path.join(baseDir, FILES.bookInfo),
+          'utf-8'
+        );
+        const info = JSON.parse(infoStr);
+        title = info.title || '';
+        author = info.author || '';
+      } catch {
+        const sample =
+          bookText.slice(0, MAX_DATA_FOR_PROMPT / 10) +
+          bookText.slice(-(MAX_DATA_FOR_PROMPT / 10));
+        await saveToFile('book_metadata_input.txt', sample, {
+          subDir: processDir,
+        });
+        const info = await extractBookInfo(sample, { subDir: processDir });
+        title = info.title || '';
+        author = info.author || '';
+        await saveToFile(
+          FILES.bookInfo,
+          { title, author },
+          { subDir: processDir }
+        );
+      }
+
+      const bookData = { title, author, chapters: allChapters };
+      await saveToFile('book_data.json', bookData, { subDir: processDir });
+
+      const { categoryIds, description } =
+        await extractBookCategoriesAndDescription(JSON.stringify(bookData), {
+          subDir: processDir,
+        });
+
+      const book = {
+        title,
+        author,
+        description,
+        chapters: allChapters,
+        categoryIds,
+      };
+      await saveToFile(FILES.bookFinal, book, { subDir: processDir });
+
+      // Renomeia pasta no final do resume para baseId + (Título)
+      try {
+        const baseId = extractBaseIdFromProcessDir(processDir);
+        const safeTitle = sanitizeDirName(title);
+        if (baseId && safeTitle) {
+          const currentDir = path.join('outputs', processDir);
+          const newDirName = `${baseId} (${safeTitle})`;
+          const newDirPath = path.join('outputs', newDirName);
+          if (currentDir !== newDirPath) {
+            await fs.rename(currentDir, newDirPath);
+            console.log(
+              `📁 [RESUME] Pasta renomeada para: outputs/${newDirName}`
+            );
+          }
+        }
+      } catch (e) {
+        console.warn('⚠️ [RESUME] Não foi possível renomear a pasta:', e);
+      }
+
+      res.json({
+        resumed: true,
+        processDir,
+        chapters: allChapters.length,
+        title,
+        author,
+        categoryIds,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Erro ao retomar processamento.' });
+    }
+  }
+);
+
+// Rota de estatísticas do livro: calcula tokens e estimativas de segmentação/saída
+app.post(
   '/extract-auto',
   middlewares.adminAuth,
   upload.single('file'),
@@ -204,7 +560,21 @@ app.post(
     }
 
     try {
-      const processId = generateProcessId();
+      const t0 = Date.now();
+      const baseId = generateProcessId();
+      const sanitizeDirName = (name: string) =>
+        (name || '')
+          .replace(/[\\/:*?"<>|]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 120);
+      const stripDiacritics = (s: string) =>
+        (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      const originalNameRaw = req.file.originalname || req.file.filename || '';
+      const safeFileBase = sanitizeDirName(
+        stripDiacritics(path.parse(originalNameRaw).name)
+      );
+      const processId = safeFileBase ? `${baseId} (${safeFileBase})` : baseId;
       await saveToFile(
         'info.txt',
         'Iniciando processamento automático por tokens...',
@@ -217,18 +587,47 @@ app.post(
         filePath: req.file.path,
         startPage: 1,
       });
-      await saveToFile('book_complete.txt', bookText, { subDir: processId });
+      await saveToFile(FILES.bookComplete, bookText, { subDir: processId });
+
+      const MAX_BOOK_TOKENS = 2_000_000;
+      const totalCharsEarly = bookText.length;
+      const totalTokensEarly = countTokens(bookText, 'gpt-5-mini');
+      await saveToFile(
+        'book_size.json',
+        {
+          totalChars: totalCharsEarly,
+          totalTokens: totalTokensEarly,
+          maxTokens: MAX_BOOK_TOKENS,
+          status: totalTokensEarly > MAX_BOOK_TOKENS ? 'exceeds_limit' : 'ok',
+        },
+        { subDir: processId }
+      );
+      if (totalTokensEarly > MAX_BOOK_TOKENS) {
+        const msg =
+          `Tamanho do livro excede o limite: ${formatNumber(
+            totalTokensEarly
+          )} tokens > ${formatNumber(MAX_BOOK_TOKENS)} tokens. ` +
+          'Processo abortado em /extract-auto.';
+        console.error(`❌ [SIZE] ${msg}`);
+        await saveToFile('error_size_limit.txt', msg, { subDir: processId });
+        res.status(413).json({
+          error: 'Livro muito grande',
+          totalTokens: totalTokensEarly,
+          maxTokens: MAX_BOOK_TOKENS,
+        });
+        return;
+      }
 
       // 2) Constrói GUIA GLOBAL via map-reduce em chunks grandes (aumentado)
-      const GUIDE_INPUT_TOKENS = 20000;
-      const GUIDE_OVERLAP_TOKENS = 2000;
+      const GUIDE_INPUT_TOKENS = 26000;
+      const GUIDE_OVERLAP_TOKENS = 1000;
       const guideChunks = splitByTokensElastic(
         bookText,
         GUIDE_INPUT_TOKENS,
         GUIDE_OVERLAP_TOKENS
       );
       await saveToFile(
-        'guide_chunks_count.txt',
+        FILES.guideChunksCount,
         `chunks: ${guideChunks.chunks.length}`,
         { subDir: processId }
       );
@@ -237,38 +636,21 @@ app.post(
         chars: c.length,
         tokens: countTokens(c, 'gpt-5-mini'),
       }));
-      await saveToFile('guide_chunks_stats.json', guideStats, {
+      await saveToFile(FILES.guideChunksStats, guideStats, {
         subDir: processId,
       });
 
       const guide = await buildGlobalGuide(guideChunks.chunks, {
         subDir: processId,
       });
-      await saveToFile('book_global_guide.json', guide, { subDir: processId });
+      await saveToFile(FILES.bookGlobalGuide, guide, { subDir: processId });
 
       // 3) Segmenta em "capítulos sintéticos" por tokens (entrada), com overlap (dinâmico por tamanho do livro)
-      const totalBookTokens = countTokens(bookText, 'gpt-5-mini');
-      // Limites de referência de tamanho do livro (tokens)
-      const MIN_BOOK_TOKENS = 80000; // ~curto
-      const MAX_BOOK_TOKENS = 900000; // ~muito longo
-      // Limites de input por capítulo sintético (tokens)
-      const MIN_CH_INPUT = 8000;
-      const MAX_CH_INPUT = 14000;
-      const clamp = (n: number, lo: number, hi: number) =>
-        Math.max(lo, Math.min(hi, n));
-      const frac = clamp(
-        (totalBookTokens - MIN_BOOK_TOKENS) /
-          Math.max(1, MAX_BOOK_TOKENS - MIN_BOOK_TOKENS),
-        0,
-        1
-      );
-      const CHAPTER_INPUT_TOKENS = Math.round(
-        MIN_CH_INPUT + frac * (MAX_CH_INPUT - MIN_CH_INPUT)
-      );
-      // Overlap como 10% do input (com limites para evitar excesso)
-      const CHAPTER_OVERLAP_TOKENS = Math.round(
-        clamp(CHAPTER_INPUT_TOKENS * 0.1, 400, 2000)
-      );
+      const totalBookTokens = totalTokensEarly;
+      const {
+        chapterInputTokens: CHAPTER_INPUT_TOKENS,
+        chapterOverlapTokens: CHAPTER_OVERLAP_TOKENS,
+      } = computeChapterSegmentationParams(totalBookTokens);
       console.log(
         `🧩 Segmentação dinâmica: livro ${formatNumber(
           totalBookTokens
@@ -284,7 +666,7 @@ app.post(
         CHAPTER_INPUT_TOKENS,
         CHAPTER_OVERLAP_TOKENS
       );
-      await saveToFile('chapter_boundaries.json', boundaries, {
+      await saveToFile(FILES.chapterBoundaries, boundaries, {
         subDir: processId,
       });
       const chapStats = chapterInputs.map((c, i) => ({
@@ -296,18 +678,8 @@ app.post(
         subDir: processId,
       });
 
-      // 4) Resume cada "capítulo" com contexto (guia + microresumo anterior)
-      // Alvo padrão reduzido; pode ser override via query ?targetOutputTokens=...
-      const TARGET_OUTPUT_TOKENS = (() => {
-        const q = Number((req.query as any).targetOutputTokens);
-        if (!isNaN(q) && q > 200 && q < 5000) return Math.round(q);
-        return 800;
-      })();
-      console.log(
-        `🎯 [CFG] target_output_tokens=${formatNumber(TARGET_OUTPUT_TOKENS)}`
-      );
       const processedChapters: Array<{ title: string; content: object[] }> = [];
-      let prevSummary: string | undefined = undefined;
+      let prevChapterFormatted: Chapter | undefined;
 
       for (let i = 0; i < chapterInputs.length; i++) {
         const inText = chapterInputs[i];
@@ -323,18 +695,21 @@ app.post(
         const chapterOut = await summarizeChapterWithContext({
           chapterText,
           guide,
-          prevSummary,
-          targetTokens: TARGET_OUTPUT_TOKENS,
+          prevChapterFormatted,
+          targetTokens: 800,
+          options: { subDir: processId, chapterIndex: i },
         });
 
-        prevSummary = chapterOut.summaryForNext;
+        prevChapterFormatted = {
+          title: chapterOut.title,
+          content: chapterOut.content,
+        };
 
         await saveToFile(
           `chapter_${String(i + 1).padStart(2, '0')}_formatted.json`,
           {
             title: chapterOut.title,
             content: chapterOut.content,
-            summaryForNext: chapterOut.summaryForNext,
           },
           { subDir: processId }
         );
@@ -353,9 +728,11 @@ app.post(
         subDir: processId,
       });
 
-      const { title, author } = await extractBookInfo(startEndSample);
+      const { title, author } = await extractBookInfo(startEndSample, {
+        subDir: processId,
+      });
       await saveToFile(
-        'book_info.json',
+        FILES.bookInfo,
         { title, author },
         { subDir: processId }
       );
@@ -364,7 +741,9 @@ app.post(
       await saveToFile('book_data.json', bookData, { subDir: processId });
 
       const { categoryIds, description } =
-        await extractBookCategoriesAndDescription(JSON.stringify(bookData));
+        await extractBookCategoriesAndDescription(JSON.stringify(bookData), {
+          subDir: processId,
+        });
 
       // 6) Resultado final
       const book = {
@@ -375,7 +754,74 @@ app.post(
         categoryIds,
       };
 
-      await saveToFile('book_final.json', book, { subDir: processId });
+      await saveToFile(FILES.bookFinal, book, { subDir: processId });
+
+      // Salva tempo total do processo (duração formatada)
+      const t1 = Date.now();
+      const totalMs = t1 - t0;
+      const minutes = Math.floor(totalMs / 60000);
+      const seconds = Math.floor((totalMs % 60000) / 1000);
+      const milliseconds = totalMs % 1000;
+      const formatted = `${String(minutes).padStart(2, '0')}:${String(
+        seconds
+      ).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`;
+      await saveToFile(
+        'process_timing.json',
+        {
+          duration: formatted,
+          startedAt: new Date(t0).toISOString(),
+          finishedAt: new Date(t1).toISOString(),
+        },
+        { subDir: processId }
+      );
+
+      // Agrega custos: soma todos os arquivos cost_*.json no diretório e grava cost_total.json
+      try {
+        const baseDir = path.join('outputs', processId);
+        const dirents = await fs.readdir(baseDir, { withFileTypes: true });
+        let totalUsd = 0;
+        let totalBrl = 0;
+        const files = dirents
+          .filter(
+            (d: any) =>
+              d.isFile() &&
+              d.name.startsWith('cost_') &&
+              d.name.endsWith('.json')
+          )
+          .map((d: any) => d.name);
+        for (const f of files) {
+          try {
+            const buf = await fs.readFile(path.join(baseDir, f), 'utf-8');
+            const js = JSON.parse(buf);
+            if (typeof js?.usd === 'number') totalUsd += js.usd;
+            if (typeof js?.brl === 'number') totalBrl += js.brl;
+          } catch {}
+        }
+        await saveToFile(
+          'cost_total.json',
+          {
+            totalUsd: Number(totalUsd.toFixed(6)),
+            totalBrl: Number(totalBrl.toFixed(6)),
+            filesCounted: files.length,
+          },
+          { subDir: processId }
+        );
+      } catch {}
+
+      // Renomeia a pasta de saída para incluir o nome do livro ao final
+      try {
+        const safeTitle = sanitizeDirName(book.title);
+        if (safeTitle.length > 0) {
+          const oldDirPath = path.join('outputs', processId);
+          const newDirName = `${baseId} (${safeTitle})`;
+          const newDirPath = path.join('outputs', newDirName);
+          await fs.rename(oldDirPath, newDirPath);
+          console.log(`📁 Pasta renomeada para: outputs/${newDirName}`);
+        }
+      } catch (e) {
+        console.warn('⚠️ Não foi possível renomear a pasta de saída:', e);
+      }
+
       res.json(book);
     } catch (error) {
       console.error(error);
@@ -388,21 +834,17 @@ app.post(
 
 const RerunChapterSchema = z.object({
   processDir: z.string().min(1, 'processDir é obrigatório'),
-  chapterIndex: z
-    .union([z.string(), z.number()])
-    .optional()
-    .transform((val, ctx) => {
-      if (val === undefined) return 0; // default 0 (zero-based)
-      const n = Number(val);
-      if (isNaN(n) || !Number.isInteger(n)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'chapterIndex inválido',
-        });
-        return z.NEVER;
-      }
-      return n; // zero-based index
-    }),
+  chapterIndex: z.union([z.string(), z.number()]).transform((val, ctx) => {
+    const n = Number(val);
+    if (val === undefined || isNaN(n) || !Number.isInteger(n) || n < 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'chapterIndex inválido (zero-based e obrigatório)',
+      });
+      return z.NEVER;
+    }
+    return n; // zero-based index
+  }),
 });
 
 app.post(
@@ -447,7 +889,7 @@ app.post(
       const chapterText = bookTextPrev.slice(start, end);
 
       // Prev summary: tenta ler o resumo do capítulo anterior (chapterIndex - 1)
-      let prevSummary: string | undefined = undefined;
+      let prevChapterFormatted: Chapter | undefined;
       if (chapterIndex > 0) {
         try {
           const prevOut = await fs.readFile(
@@ -458,26 +900,28 @@ app.post(
             'utf-8'
           );
           const prevJson = JSON.parse(prevOut);
-          if (typeof prevJson.summaryForNext === 'string') {
-            prevSummary = prevJson.summaryForNext;
+          if (prevJson && Array.isArray(prevJson.content)) {
+            prevChapterFormatted = {
+              title: prevJson.title || '',
+              content: prevJson.content,
+            };
           }
         } catch {}
       }
 
       const TARGET_OUTPUT_TOKENS = 800;
 
-      const fileNum = chapterIndex + 1;
       const chapterOut = await summarizeChapterWithContext({
         chapterText,
         guide,
-        prevSummary,
+        prevChapterFormatted,
         targetTokens: TARGET_OUTPUT_TOKENS,
-        options: { subDir: rerunSubDir },
+        options: { subDir: rerunSubDir, chapterIndex },
       });
 
       // Salva capítulo reprocessado
       await saveToFile(
-        `chapter_${String(fileNum).padStart(2, '0')}_formatted.json`,
+        `chapter_${String(chapterIndex + 1).padStart(2, '0')}_formatted.json`,
         { title: chapterOut.title, content: chapterOut.content },
         { subDir: rerunSubDir }
       );
@@ -526,6 +970,70 @@ app.post(
       res
         .status(500)
         .json({ error: 'Erro ao reprocessar capítulo a partir de outputs.' });
+    }
+  }
+);
+
+// Rota de estatísticas do livro: calcula tokens e estimativas de segmentação/saída
+app.post(
+  '/stats',
+  middlewares.adminAuth,
+  upload.single('file'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      if (!req.file) {
+        res.status(400).json({
+          error: 'Envie um arquivo PDF para calcular as estatísticas.',
+        });
+        return;
+      }
+
+      // Carrega texto do livro
+      const bookText = await extractTextFromPdfRange({
+        filePath: req.file.path,
+        startPage: 1,
+      });
+
+      const totalChars = bookText.length;
+      const totalTokens = countTokens(bookText, 'gpt-5-mini');
+
+      // Parâmetros de segmentação reutilizáveis
+      const {
+        chapterInputTokens: CHAPTER_INPUT_TOKENS,
+        chapterOverlapTokens: CHAPTER_OVERLAP_TOKENS,
+      } = computeChapterSegmentationParams(totalTokens);
+
+      // Estima segmentação real usando o mesmo splitter
+      const { chunks } = splitByTokensElastic(
+        bookText,
+        CHAPTER_INPUT_TOKENS,
+        CHAPTER_OVERLAP_TOKENS
+      );
+      const numChapters = chunks.length;
+
+      // Saída estimada por capítulo
+      const targetOutputTokens =
+        Number(req.query.targetOutputTokens || req.body?.targetOutputTokens) ||
+        800;
+      const effectiveFactor = 0.5; // mesmo fator do prompt
+      const estimatedOutputTotal = numChapters * targetOutputTokens;
+
+      res.json({
+        totalChars,
+        totalTokens,
+        segmentation: {
+          chapterInputTokens: CHAPTER_INPUT_TOKENS,
+          overlapTokens: CHAPTER_OVERLAP_TOKENS,
+          estimatedChapters: numChapters,
+        },
+        output: {
+          targetOutputTokens,
+          estimatedOutputTotal,
+        },
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Erro ao gerar estatísticas.' });
     }
   }
 );

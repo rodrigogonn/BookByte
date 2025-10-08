@@ -5,6 +5,83 @@ import { categories } from './constants/categories';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const model: ChatModel = 'gpt-5-mini';
+const cheapModel: ChatModel = 'gpt-5-nano';
+
+// ===== Estimativa de custo (configurável por ambiente, preços por 1 milhão de tokens) =====
+function getPricingPerMillion(model: string): {
+  inputPer1M: number;
+  outputPer1M: number;
+} {
+  const mini = {
+    inputPer1M: Number(process.env.PRICE_PER_M_GPT5_MINI_IN || 0),
+    outputPer1M: Number(process.env.PRICE_PER_M_GPT5_MINI_OUT || 0),
+  };
+  const nano = {
+    inputPer1M: Number(process.env.PRICE_PER_M_GPT5_NANO_IN || 0),
+    outputPer1M: Number(process.env.PRICE_PER_M_GPT5_NANO_OUT || 0),
+  };
+  if (model.includes('nano')) return nano;
+  if (model.includes('mini')) return mini;
+  return { inputPer1M: 0, outputPer1M: 0 };
+}
+
+function estimateCostUSD(args: {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+}) {
+  const { model, inputTokens, outputTokens } = args;
+  const p = getPricingPerMillion(model);
+  const inUsd = (inputTokens / 1_000_000) * p.inputPer1M;
+  const outUsd = (outputTokens / 1_000_000) * p.outputPer1M;
+  const totalUsd = inUsd + outUsd;
+  return {
+    usd: Number(totalUsd.toFixed(6)),
+    breakdown: {
+      inputUsd: Number(inUsd.toFixed(6)),
+      outputUsd: Number(outUsd.toFixed(6)),
+      inputTokens,
+      outputTokens,
+    },
+  };
+}
+
+async function computeAndSaveCost(options: {
+  usage?: OpenAI.Completions.CompletionUsage;
+  model: string;
+  costFileName: string;
+  subDir?: string;
+}) {
+  if (
+    !options.usage ||
+    options.usage.prompt_tokens == null ||
+    options.usage.completion_tokens == null
+  ) {
+    return null;
+  }
+
+  const inputTokens = Number(options.usage.prompt_tokens);
+  const outputTokens = Number(options.usage.completion_tokens);
+
+  const cost = estimateCostUSD({
+    model: options.model,
+    inputTokens,
+    outputTokens,
+  });
+
+  const pricing = getPricingPerMillion(options.model);
+  const payload = {
+    usd: cost.usd,
+    brl: Number((cost.usd * 5.65).toFixed(6)),
+    breakdown: cost.breakdown,
+    model: options.model,
+    pricingPer1M: pricing,
+    usage: options.usage,
+  };
+
+  await saveToFile(options.costFileName, payload, { subDir: options.subDir });
+  return { inputTokens, outputTokens, cost };
+}
 
 export const summarizeChunk = async (text: string): Promise<string> => {
   const prompt = `
@@ -25,7 +102,6 @@ export const summarizeChunk = async (text: string): Promise<string> => {
   const response = await openai.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_completion_tokens: 16000,
   });
 
   const responseContent = response.choices[0].message.content?.trim();
@@ -196,7 +272,6 @@ export const summarizeAndFormatChapter = async (
   const response = await openai.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_completion_tokens: 16000,
     response_format: { type: 'json_object' },
   });
 
@@ -215,7 +290,8 @@ export const summarizeAndFormatChapter = async (
 };
 
 export const extractBookInfo = async (
-  text: string
+  text: string,
+  options?: { subDir?: string }
 ): Promise<{ title: string; author: string }> => {
   const prompt = `
     Analise o seguinte texto e extraia o nome do livro e seu autor.
@@ -236,7 +312,6 @@ export const extractBookInfo = async (
   const response = await openai.chat.completions.create({
     model,
     messages: [{ role: 'user', content: prompt }],
-    max_completion_tokens: 1000,
     response_format: { type: 'json_object' },
   });
 
@@ -244,27 +319,42 @@ export const extractBookInfo = async (
     throw new Error('Nenhum conteúdo retornado pelo modelo');
   }
 
-  const bookInfo = JSON.parse(response.choices[0].message.content);
+  const content = response.choices[0].message.content;
+  const bookInfo = JSON.parse(content);
+  // custo estimado via helper
+  try {
+    await computeAndSaveCost({
+      model,
+      costFileName: 'cost_book_info.json',
+      subDir: options?.subDir,
+      usage: response.usage,
+    });
+  } catch {}
   return bookInfo;
 };
 
 export const extractBookCategoriesAndDescription = async (
-  text: string
+  text: string,
+  options?: { subDir?: string }
 ): Promise<{ categoryIds: number[]; description: string }> => {
   const categoriesList = categories
     .map((cat) => `- ${cat.id}. ${cat.name}`)
     .join('\n    ');
 
   const prompt = `
-    Analise o seguinte livro e defina as categorias que melhor se encaixam.
-    Também defina uma boa descrição do livro para colocar na página inicial do livro.
+    Analise o livro e selecione as categorias MAIS RELEVANTES do conjunto abaixo.
+    Também escreva uma boa descrição, clara, sem spoilers, voltada ao público geral.
+
+    Regras de seleção:
+    - Retorne no MÁXIMO 3 categorias, podendo ser 1 ou 2, ordenadas por relevância.
+    - Escolha uma categoria somente se ela for NUCLEAR ao tema do livro, não periférica.
 
     **Lista de Categorias Disponíveis:**
     ${categoriesList}
 
     Retorne no formato JSON com a seguinte estrutura:
     {
-      "categoryIds": [1, 2, 3],
+      "categoryIds": [1, 2], // até 3 ids no total, únicos e ordenados por relevância
       "description": "Descrição do livro"
     }
 
@@ -276,8 +366,14 @@ export const extractBookCategoriesAndDescription = async (
 
   const response = await openai.chat.completions.create({
     model,
-    messages: [{ role: 'user', content: prompt }],
-    max_completion_tokens: 2000,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.',
+      },
+      { role: 'user', content: prompt },
+    ],
     response_format: { type: 'json_object' },
   });
 
@@ -285,7 +381,17 @@ export const extractBookCategoriesAndDescription = async (
     throw new Error('Nenhum conteúdo retornado pelo modelo');
   }
 
-  const bookCategories = JSON.parse(response.choices[0].message.content);
+  const content = response.choices[0].message.content;
+  const bookCategories = JSON.parse(content);
+  // custo estimado via helper (com system message)
+  try {
+    await computeAndSaveCost({
+      model,
+      costFileName: 'cost_categories.json',
+      subDir: options?.subDir,
+      usage: response.usage,
+    });
+  } catch {}
   return bookCategories;
 };
 
@@ -317,12 +423,8 @@ export interface KeyPoint {
 export type ChapterContent = Paragraph | KeyPoint;
 
 export interface Chapter {
-  content: ChapterContent[];
-}
-
-export interface ChapterWithMeta extends Chapter {
   title: string;
-  summaryForNext: string; // 100–200 tokens a serem lembrados no próximo capítulo
+  content: ChapterContent[];
 }
 
 // ===== Guia Global (map-reduce) =====
@@ -341,6 +443,14 @@ export async function buildGlobalGuide(
   options?: { subDir?: string; polishTargetTokens?: number }
 ): Promise<GlobalGuide> {
   const maps: GlobalGuide[] = [];
+  const subDir = options?.subDir;
+  const guideCostEntries: Array<{
+    index: number;
+    inputTokens: number;
+    outputTokens: number;
+    usd: number;
+  }> = [];
+  // Tenta reaproveitar mapas já gerados: se existir guide_output_XX.json, reutiliza
   for (let i = 0; i < chunks.length; i++) {
     const ctext = chunks[i];
     const ctokens = countTokens(ctext, 'gpt-5-mini');
@@ -349,11 +459,25 @@ export async function buildGlobalGuide(
         ctext.length
       )} chars, ${formatNumber(ctokens)} tokens`
     );
-    await saveToFile(
-      `guide_input_${String(i + 1).padStart(2, '0')}.txt`,
-      ctext,
-      { subDir: options?.subDir }
-    );
+    const idxStr = String(i + 1).padStart(2, '0');
+    const outFileName = `guide_output_${idxStr}.json`;
+    if (subDir) {
+      try {
+        const p = require('path');
+        const fsp = require('fs/promises');
+        const existing = await fsp.readFile(
+          p.join('outputs', subDir, outFileName),
+          'utf-8'
+        );
+        const parsedExisting = JSON.parse(existing);
+        maps.push(parsedExisting);
+        console.log(
+          `↪️  [GUIA] Pulando chunk ${i + 1} (já existe ${outFileName})`
+        );
+        continue;
+      } catch {}
+    }
+    await saveToFile(`guide_input_${idxStr}.txt`, ctext, { subDir });
     const prompt = `
       Você é um analista literário. Extraia um guia CONCISO do trecho abaixo, retornando JSON:
       {
@@ -381,17 +505,17 @@ export async function buildGlobalGuide(
     while (attempt < maxAttempts && !parsed) {
       attempt++;
       try {
+        const systemMsg =
+          'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.';
         const resp = await openai.chat.completions.create({
-          model,
+          model: cheapModel,
           messages: [
             {
               role: 'system',
-              content:
-                'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.',
+              content: systemMsg,
             },
             { role: 'user', content: prompt },
           ],
-          max_completion_tokens: 8000,
           response_format: { type: 'json_object' },
         });
         const content = resp.choices[0].message.content;
@@ -404,13 +528,39 @@ export async function buildGlobalGuide(
             JSON.stringify(resp, null, 2),
             { subDir: options?.subDir }
           );
+          // Salva custo baseado em usage mesmo sem conteúdo
+          try {
+            await computeAndSaveCost({
+              model: cheapModel,
+              costFileName: `cost_guide_${idxStr}.json`,
+              subDir,
+              usage: resp.usage,
+            });
+          } catch {}
           throw new Error('Resposta vazia do modelo');
         }
         parsed = JSON.parse(content);
+        // custo estimado usando helper (por milhão)
+        {
+          const ret = await computeAndSaveCost({
+            model: cheapModel,
+            costFileName: `cost_guide_${idxStr}.json`,
+            subDir,
+            usage: resp.usage,
+          });
+          if (ret) {
+            guideCostEntries.push({
+              index: i + 1,
+              inputTokens: ret.inputTokens,
+              outputTokens: ret.outputTokens,
+              usd: ret.cost.usd,
+            });
+          }
+        }
         await saveToFile(
-          `guide_output_${String(i + 1).padStart(2, '0')}.json`,
+          `guide_output_${idxStr}.json`,
           JSON.stringify(parsed, null, 2),
-          { subDir: options?.subDir }
+          { subDir }
         );
       } catch (e) {
         console.error(
@@ -494,17 +644,17 @@ async function polishGlobalGuide(
   while (attempt < maxAttempts && !parsed) {
     attempt++;
     try {
+      const systemMsg =
+        'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.';
       const resp = await openai.chat.completions.create({
-        model,
+        model: cheapModel,
         messages: [
           {
             role: 'system',
-            content:
-              'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.',
+            content: systemMsg,
           },
           { role: 'user', content: prompt },
         ],
-        max_completion_tokens: 8000,
         response_format: { type: 'json_object' },
       });
       const content = resp.choices[0].message.content;
@@ -514,9 +664,25 @@ async function polishGlobalGuide(
           JSON.stringify(resp, null, 2),
           { subDir }
         );
+        // Salva custo baseado em usage mesmo sem conteúdo
+        try {
+          await computeAndSaveCost({
+            model: cheapModel,
+            costFileName: `cost_guide_polish_attempt${attempt}.json`,
+            subDir,
+            usage: resp.usage,
+          });
+        } catch {}
         throw new Error('Resposta vazia ao polir guia');
       }
       parsed = JSON.parse(content);
+      // custo estimado (polish) via helper
+      await computeAndSaveCost({
+        model: cheapModel,
+        costFileName: `cost_guide_polish_attempt${attempt}.json`,
+        subDir,
+        usage: resp.usage,
+      });
       await saveToFile(
         'book_global_guide_polish_output.json',
         JSON.stringify(parsed, null, 2),
@@ -534,9 +700,7 @@ async function polishGlobalGuide(
 
 // ===== Resumo com contexto e limite de KEY_POINTS =====
 
-export type ChapterOutput = ChapterWithMeta;
-
-function sanitizeChapterOutput(ch: ChapterOutput): ChapterOutput {
+function sanitizeChapterOutput(ch: Chapter): Chapter {
   const sanitizedContent = (ch.content || []).map((item: any) => {
     // remove chaves com null
     Object.keys(item).forEach((k) => {
@@ -544,11 +708,9 @@ function sanitizeChapterOutput(ch: ChapterOutput): ChapterOutput {
     });
     return item;
   });
-  const sanitized: ChapterOutput = {
+  const sanitized: Chapter = {
     title: typeof ch.title === 'string' ? ch.title : '',
     content: sanitizedContent,
-    summaryForNext:
-      typeof ch.summaryForNext === 'string' ? ch.summaryForNext : '',
   };
   return sanitized;
 }
@@ -556,15 +718,23 @@ function sanitizeChapterOutput(ch: ChapterOutput): ChapterOutput {
 export async function summarizeChapterWithContext(args: {
   chapterText: string;
   guide: GlobalGuide;
-  prevSummary?: string;
+  prevChapterFormatted?: Chapter;
   targetTokens?: number;
-  options?: { subDir?: string };
-}): Promise<ChapterOutput> {
-  const { chapterText, guide, prevSummary, targetTokens = 900, options } = args;
+  options: { subDir: string; chapterIndex: number };
+}): Promise<Chapter> {
+  const {
+    chapterText,
+    guide,
+    prevChapterFormatted,
+    targetTokens = 900,
+    options,
+  } = args;
 
   // Logs de contexto
   const inTokens = countTokens(chapterText, 'gpt-5-mini');
-  const prevTokens = prevSummary ? countTokens(prevSummary, 'gpt-5-mini') : 0;
+  const prevTokens = prevChapterFormatted
+    ? countTokens(JSON.stringify(prevChapterFormatted), 'gpt-5-mini')
+    : 0;
   const guideTokens = countTokens(JSON.stringify(guide), 'gpt-5-mini');
   const effectiveTarget = Math.max(100, Math.round(targetTokens * 0.45));
   console.log(
@@ -583,20 +753,17 @@ export async function summarizeChapterWithContext(args: {
     Você vai condensar um trecho do livro em um capítulo de saída coeso (início, meio, fim).
     Mantenha o estilo e a voz original do autor. O resultado deve soar como escrito pelo próprio autor, apenas mais conciso.
     Não explique a história em metacomentários; reescreva com fluidez, preservando os detalhes essenciais e a experiência de leitura.
-    Use o GUIA GLOBAL e o microresumo anterior para manter consistência de nomes, lugares, tom e continuidade.
+    Use o GUIA GLOBAL e o capítulo anterior já formatado para manter consistência de nomes, lugares, tom e continuidade.
 
     GUIA GLOBAL (canônico e conciso):
     ${JSON.stringify(guide)}
 
-    MICRORESUMO ANTERIOR (se existir):
-    ${prevSummary || 'N/A'}
+    CAPÍTULO ANTERIOR (resumo já formatado; use apenas para continuidade e consistência. NÃO recapitule literalmente, evite repetir conteúdo):
+    ${prevChapterFormatted ? JSON.stringify(prevChapterFormatted) : 'N/A'}
 
     INSTRUÇÕES ESTRUTURAIS:
-    - Comece com 1–2 frases de ANCORAGEM se o trecho começar no meio (quem/onde/objetivo), sem inventar fatos.
     - Preserve diálogos importantes; evite quebrar falas.
-    - Termine com FECHAMENTO claro: estado atual, pendências, próximo objetivo imediato.
     - Alvo de tamanho: ~${effectiveTarget} tokens. É preferível ficar ABAIXO do alvo do que acima. Ao se aproximar do limite, finalize o parágrafo em curso e encerre.
-    - Não escreva rótulos como "ANCORAGEM:", "Âncora:", "Fechamento:", "Conclusão:" ou similares. Integre ancoragem e fechamento como parte natural da narrativa, sem cabeçalhos.
     - Não use cabeçalhos, marcadores, listas ou prefixos técnicos no corpo. Produza apenas parágrafos narrativos (e KEY_POINTS conforme a estrutura), sem títulos internos.
     - Título: gere um título curto e descritivo SEM prefixos como "Capítulo", números ou travessões. Ex.: "Uma festa inesperada" (não use "Capítulo I — ...").
     - KEY_POINTS: até 3 (0, 1, 2 ou 3). Inclua apenas se agregarem valor real e INSIRA cada KEY_POINT imediatamente após o parágrafo relacionado (não agrupe todos no final):
@@ -606,8 +773,10 @@ export async function summarizeChapterWithContext(args: {
         2) Memorável/reflexiva: provoca insight/ponderação (aforística, não banal).
         3) Universalidade: trata de temas gerais (vida, tempo, escolha, coragem, etc.).
         4) Linguagem adequada: sem vulgaridade/insulto gratuito.
-        5) Referência correta: "reference" = quem falou (personagem/narrador), nunca capítulo/seção/página. Se não souber, NÃO inclua QUOTE.
+        5) Referência correta: "reference" = quem falou, nunca capítulo/seção/página. Se não souber, NÃO inclua QUOTE.
       - MOMENT: apenas momentos genuinamente decisivos.
+    - Proibição de metalinguagem/rotulagem: não escreva rótulos ou comentários de estrutura como "Momento decisivo:", "Momento:", "Moment:", "marco do capítulo", "clímax do capítulo", "Quote:", "Citação:", "Insight:" ou similares. A redação dos KEY_POINTS deve ser natural, sem prefixos.
+    - Não mencione que é um capítulo/livro, nem se dirija ao leitor. Descreva o evento/ideia diretamente, sem metacomentários.
     - Evite redundância entre parágrafos e KEY_POINTS: se uma fala virar QUOTE, NÃO repita a mesma frase literalmente no parágrafo.
     - Se não houver KEY_POINTS realmente bons, retorne ZERO key points (é aceitável 0).
     - NUNCA use null; omita campos opcionais inexistentes.
@@ -643,16 +812,12 @@ export async function summarizeChapterWithContext(args: {
     type ChapterContent = Paragraph | KeyPoint;
 
     interface Chapter {
-      content: ChapterContent[];
-    }
-
-    interface ChapterWithMeta extends Chapter {
       title: string;
-      summaryForNext: string; // 100–200 tokens
+      content: ChapterContent[];
     }
     \`\`\`
 
-    FORMATO DE SAÍDA (JSON): deve ser um \"ChapterWithMeta\" válido.
+    FORMATO DE SAÍDA (JSON): deve ser um \"Chapter\" válido.
 
     TEXTO DO CAPÍTULO (já contém pequena sobreposição com o anterior e o próximo):
     """
@@ -661,50 +826,62 @@ export async function summarizeChapterWithContext(args: {
   `;
 
   // Persistir prompt para debug
-  await saveToFile('chapter_prompt.txt', prompt, { subDir: options?.subDir });
+  const chapterIdxLabel = String(options.chapterIndex + 1).padStart(2, '0');
+  const promptFile = `chapter_${chapterIdxLabel}_prompt.txt`;
+  await saveToFile(promptFile, prompt, { subDir: options.subDir });
 
-  let parsed: ChapterOutput | null = null;
+  let parsed: Chapter | null = null;
   let attemptCap = 0;
   const maxAttemptsCap = 3;
   while (attemptCap < maxAttemptsCap && !parsed) {
     attemptCap++;
     try {
+      const systemMsg =
+        'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.';
       const response = await openai.chat.completions.create({
         model,
         messages: [
           {
             role: 'system',
-            content:
-              'Responda somente JSON válido (um único objeto). Sem explicações nem texto extra.',
+            content: systemMsg,
           },
           { role: 'user', content: prompt },
         ],
-        max_completion_tokens: Math.max(
-          8000,
-          Math.round(effectiveTarget * 1.5)
-        ),
         response_format: { type: 'json_object' },
       });
       const content = response.choices[0].message.content;
       if (!content) {
-        await saveToFile(
-          `chapter_resp_attempt${attemptCap}.json`,
-          JSON.stringify(response, null, 2),
-          { subDir: options?.subDir }
-        );
+        const respFile = `chapter_${chapterIdxLabel}_resp_attempt${attemptCap}.json`;
+        await saveToFile(respFile, JSON.stringify(response, null, 2), {
+          subDir: options.subDir,
+        });
+        // Salva custo com usage mesmo sem conteúdo
+        try {
+          await computeAndSaveCost({
+            model,
+            costFileName: `cost_chapter_${chapterIdxLabel}_attempt${attemptCap}.json`,
+            subDir: options.subDir,
+            usage: response.usage,
+          });
+        } catch {}
         throw new Error('Nenhum conteúdo retornado pelo modelo');
       }
       parsed = sanitizeChapterOutput(JSON.parse(content));
-      await saveToFile(
-        `chapter_output_attempt${attemptCap}.json`,
-        JSON.stringify(parsed, null, 2),
-        { subDir: options?.subDir }
-      );
+      // custo estimado capítulo via helper
+      await computeAndSaveCost({
+        model,
+        costFileName: `cost_chapter_${chapterIdxLabel}_attempt${attemptCap}.json`,
+        subDir: options.subDir,
+        usage: response.usage,
+      });
+      const outAttemptFile = `chapter_${chapterIdxLabel}_output_attempt${attemptCap}.json`;
+      await saveToFile(outAttemptFile, JSON.stringify(parsed, null, 2), {
+        subDir: options.subDir,
+      });
     } catch (e) {
       console.error(`❌ [CAP] Erro ao resumir (tentativa ${attemptCap}):`, e);
-      await saveToFile(`chapter_error_attempt${attemptCap}.txt`, String(e), {
-        subDir: options?.subDir,
-      });
+      const errFile = `chapter_${chapterIdxLabel}_error_attempt${attemptCap}.txt`;
+      await saveToFile(errFile, String(e), { subDir: options.subDir });
       if (attemptCap >= maxAttemptsCap) throw e;
       await new Promise((r) => setTimeout(r, attemptCap * 1000));
     }
@@ -732,8 +909,6 @@ export async function summarizeChapterWithContext(args: {
       outText.length
     )} chars, ${formatNumber(outTokens)} tokens`
   );
-  await saveToFile('chapter_formatted.json', parsed, {
-    subDir: options?.subDir,
-  });
+  // Não salvar capítulo formatado aqui; quem salva é a rota, com numeração
   return parsed;
 }

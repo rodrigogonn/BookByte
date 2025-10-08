@@ -308,3 +308,32 @@ export function splitByTokensElastic(
   enc.free();
   return { chunks: result, boundaries };
 }
+
+// ===== Cálculos reutilizáveis para estatísticas/segmentação =====
+
+export function computeChapterSegmentationParams(totalTokens: number): {
+  chapterInputTokens: number;
+  chapterOverlapTokens: number;
+} {
+  // Limites de referência de tamanho do livro (tokens)
+  const MIN_BOOK_TOKENS = 80000; // ~curto
+  const MAX_BOOK_TOKENS = 1200000; // ~muito longo
+  // Limites de input por capítulo sintético (tokens)
+  const MIN_CH_INPUT = 11000;
+  const MAX_CH_INPUT = 40000;
+  const clamp = (n: number, lo: number, hi: number) =>
+    Math.max(lo, Math.min(hi, n));
+  const frac = clamp(
+    (totalTokens - MIN_BOOK_TOKENS) /
+      Math.max(1, MAX_BOOK_TOKENS - MIN_BOOK_TOKENS),
+    0,
+    1
+  );
+  const chapterInputTokens = Math.round(
+    MIN_CH_INPUT + frac * (MAX_CH_INPUT - MIN_CH_INPUT)
+  );
+  const chapterOverlapTokens = Math.round(
+    clamp(chapterInputTokens * 0.1, 400, 2000)
+  );
+  return { chapterInputTokens, chapterOverlapTokens };
+}
